@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.context.RequestScoped;
 import jakarta.enterprise.context.control.ActivateRequestContext;
 import jakarta.inject.Inject;
 
@@ -18,6 +19,8 @@ import dev.langchain4j.agent.tool.Tool;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.guardrail.OutputGuardrail;
+import dev.langchain4j.guardrail.OutputGuardrailResult;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
@@ -25,6 +28,7 @@ import dev.langchain4j.model.output.FinishReason;
 import dev.langchain4j.model.output.TokenUsage;
 import dev.langchain4j.service.Result;
 import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.service.guardrail.OutputGuardrails;
 import io.quarkiverse.langchain4j.RegisterAiService;
 import io.quarkus.test.QuarkusUnitTest;
 
@@ -32,13 +36,20 @@ import io.quarkus.test.QuarkusUnitTest;
  * {@link Result#intermediateResponses()} and {@link Result#finalResponse()} have existed upstream since
  * langchain4j 1.2.0 and are populated by {@code DefaultAiServices} for every {@code Result}-returning
  * method. They must be populated by the Quarkus implementation too.
+ * <p>
+ * They are also the only way to get at what the model actually said when an output guardrail rewrites the
+ * response: upstream parses the guardrail's output into {@link Result#content()} but takes
+ * {@code finalResponse()} and {@code intermediateResponses()} from the {@code ToolServiceResult}, which the
+ * guardrails never touch. So a {@code Result}-returning method exposes both the pre-guardrail and the
+ * post-guardrail view of the same invocation, and this test pins that down.
  */
 public class ResultIntermediateAndFinalResponsesTest {
 
     @RegisterExtension
     static final QuarkusUnitTest unitTest = new QuarkusUnitTest()
             .setArchiveProducer(() -> ShrinkWrap.create(JavaArchive.class)
-                    .addClasses(MyAiService.class, MyTools.class, MyChatModelSupplier.class, MyChatModel.class));
+                    .addClasses(MyAiService.class, MyTools.class, MyChatModelSupplier.class, MyChatModel.class,
+                            SuffixingOutputGuardrail.class));
 
     @Inject
     MyAiService aiService;
@@ -86,9 +97,55 @@ public class ResultIntermediateAndFinalResponsesTest {
         assertThat(result.finalResponse().aiMessage().text()).isEqualTo("straight answer");
     }
 
+    @Test
+    @ActivateRequestContext
+    void bothThePreGuardrailAndThePostGuardrailResponseAreAvailable() {
+        Result<String> result = aiService.chatWithRewritingGuardrail("tools");
+
+        // content() is what the caller asked for: the output guardrail's rewrite
+        assertThat(result.content()).isEqualTo("all done [checked]");
+
+        // finalResponse() is what the model said, before any guardrail touched it
+        assertThat(result.finalResponse()).isNotNull();
+        assertThat(result.finalResponse().aiMessage().text()).isEqualTo("all done");
+
+        // which is the whole point: a rewriting guardrail makes the two views differ, and both are reachable
+        assertThat(result.content()).isNotEqualTo(result.finalResponse().aiMessage().text());
+
+        // a rewrite preserves the response metadata, so the text is what tells the two views apart
+        assertThat(result.finalResponse().metadata().id()).isEqualTo("final");
+        assertThat(result.finalResponse().metadata().modelName()).isEqualTo("stub-model");
+        assertThat(result.finalResponse().aiMessage().hasToolExecutionRequests()).isFalse();
+        assertThat(result.finishReason()).isEqualTo(FinishReason.STOP);
+
+        // the guardrail runs once, on the final response only: the tool-calling rounds are reported untouched
+        assertThat(result.intermediateResponses()).hasSize(2);
+        assertThat(result.intermediateResponses().get(0).metadata().id()).isEqualTo("round-1");
+        assertThat(result.intermediateResponses().get(1).metadata().id()).isEqualTo("round-2");
+        assertThat(result.intermediateResponses())
+                .allSatisfy(response -> assertThat(response.aiMessage().text()).doesNotContain("[checked]"));
+
+        assertThat(result.toolExecutions()).hasSize(2);
+    }
+
     @RegisterAiService(chatLanguageModelSupplier = MyChatModelSupplier.class, tools = MyTools.class)
     public interface MyAiService {
         Result<String> chat(@UserMessage String message);
+
+        @OutputGuardrails(SuffixingOutputGuardrail.class)
+        Result<String> chatWithRewritingGuardrail(@UserMessage String message);
+    }
+
+    /**
+     * Rewrites the response, which is what makes the pre-guardrail and post-guardrail views differ.
+     */
+    @RequestScoped
+    public static class SuffixingOutputGuardrail implements OutputGuardrail {
+
+        @Override
+        public OutputGuardrailResult validate(AiMessage responseFromLLM) {
+            return successWith(responseFromLLM.text() + " [checked]");
+        }
     }
 
     @ApplicationScoped
