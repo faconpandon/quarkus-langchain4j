@@ -107,10 +107,8 @@ public class McpRecorder {
                                 .httpClient(vertx.get().createHttpClient(httpClientOptions))
                                 .mcpClientName(key)
                                 .timeout(runtimeConfig.toolExecutionTimeout());
-                        if (!runtimeConfig.header().isEmpty()) {
-                            streamableBuilder.headers(runtimeConfig.header());
-                        }
-                        mcpHeadersSupplier.ifPresent(streamableBuilder::headers);
+                        combineHeaders(runtimeConfig.header(), mcpHeadersSupplier)
+                                .ifPresent(streamableBuilder::headers);
                         streamableBuilder.subsidiaryChannel(runtimeConfig.subsidiaryChannel());
                         yield streamableBuilder.build();
                     }
@@ -235,6 +233,32 @@ public class McpRecorder {
                 return new QuarkusMcpToolProvider(clients, exposeResourcesAsTools);
             }
         };
+    }
+
+    /**
+     * Combines the statically configured headers with the headers provided by a {@link McpHeadersSupplier} bean.
+     * Both are optional, and when both are present, a header supplied for a particular call wins over a
+     * statically configured header of the same name.
+     *
+     * @return the combined supplier, or an empty optional when there are no headers to add at all
+     */
+    private static Optional<McpHeadersSupplier> combineHeaders(Map<String, String> staticHeaders,
+            Optional<McpHeadersSupplier> dynamicHeaders) {
+        if (staticHeaders.isEmpty()) {
+            return dynamicHeaders;
+        }
+        if (dynamicHeaders.isEmpty()) {
+            return Optional.of(context -> staticHeaders);
+        }
+        McpHeadersSupplier dynamicHeadersSupplier = dynamicHeaders.get();
+        return Optional.of(context -> {
+            Map<String, String> headers = new HashMap<>(staticHeaders);
+            Map<String, String> suppliedHeaders = dynamicHeadersSupplier.apply(context);
+            if (suppliedHeaders != null) {
+                headers.putAll(suppliedHeaders);
+            }
+            return headers;
+        });
     }
 
     private Optional<McpHeadersSupplier> resolveMcpHeadersSupplier() {
