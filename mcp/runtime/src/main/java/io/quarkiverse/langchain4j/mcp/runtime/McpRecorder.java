@@ -15,6 +15,7 @@ import java.util.function.Supplier;
 import javax.net.ssl.SSLContext;
 
 import dev.langchain4j.mcp.client.DefaultMcpClient;
+import dev.langchain4j.mcp.client.McpCallContext;
 import dev.langchain4j.mcp.client.McpClient;
 import dev.langchain4j.mcp.client.McpClientListener;
 import dev.langchain4j.mcp.client.McpHeadersSupplier;
@@ -107,8 +108,11 @@ public class McpRecorder {
                                 .httpClient(vertx.get().createHttpClient(httpClientOptions))
                                 .mcpClientName(key)
                                 .timeout(runtimeConfig.toolExecutionTimeout());
-                        combineHeaders(runtimeConfig.header(), mcpHeadersSupplier)
-                                .ifPresent(streamableBuilder::headers);
+                        Optional<McpHeadersSupplier> combinedHeaders = combineHeaders(runtimeConfig.header(),
+                                mcpHeadersSupplier);
+                        if (combinedHeaders.isPresent()) {
+                            streamableBuilder.headers(combinedHeaders.get());
+                        }
                         streamableBuilder.subsidiaryChannel(runtimeConfig.subsidiaryChannel());
                         yield streamableBuilder.build();
                     }
@@ -248,16 +252,24 @@ public class McpRecorder {
             return dynamicHeaders;
         }
         if (dynamicHeaders.isEmpty()) {
-            return Optional.of(context -> staticHeaders);
+            return Optional.of(new McpHeadersSupplier() {
+                @Override
+                public Map<String, String> apply(McpCallContext context) {
+                    return staticHeaders;
+                }
+            });
         }
         McpHeadersSupplier dynamicHeadersSupplier = dynamicHeaders.get();
-        return Optional.of(context -> {
-            Map<String, String> headers = new HashMap<>(staticHeaders);
-            Map<String, String> suppliedHeaders = dynamicHeadersSupplier.apply(context);
-            if (suppliedHeaders != null) {
-                headers.putAll(suppliedHeaders);
+        return Optional.of(new McpHeadersSupplier() {
+            @Override
+            public Map<String, String> apply(McpCallContext context) {
+                Map<String, String> headers = new HashMap<>(staticHeaders);
+                Map<String, String> suppliedHeaders = dynamicHeadersSupplier.apply(context);
+                if (suppliedHeaders != null) {
+                    headers.putAll(suppliedHeaders);
+                }
+                return headers;
             }
-            return headers;
         });
     }
 
